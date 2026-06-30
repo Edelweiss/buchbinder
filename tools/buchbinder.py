@@ -53,6 +53,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)
 DEFAULT_SOURCE = os.path.join(PROJECT_ROOT, "data", "edelweiss")
 DEFAULT_PUBLISH = os.path.join(PROJECT_ROOT, "data", "publish")
+DEFAULT_IMAGES = os.path.join(PROJECT_ROOT, "data", "images")
 
 # Candidate locations for the LibreOffice "soffice" binary.
 SOFFICE_CANDIDATES = [
@@ -285,6 +286,186 @@ class ParsedSection:
     master_styles: str    # inner of office:master-styles (styles.xml)
     content_ns: str       # namespace soup of document-content
     styles_ns: str        # namespace soup of document-styles
+    images: List["EmbeddedImage"] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Embedded images (referenced via [[image(NAME)]] ODT annotations)
+# --------------------------------------------------------------------------- #
+
+
+_IMG_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+_IMG_EXTS = (".png", ".jpg", ".jpeg")
+IMAGE_TARGET_WIDTH_CM = 12.0
+
+# Annotation block (single line or multi-line); the image marker pattern.
+_ANNOT_RE = re.compile(r"<office:annotation\b[^>]*>.*?</office:annotation>", re.S)
+_IMG_REF_RE = re.compile(r"\[\[image\(([^)]+)\)\]\]")
+
+# Private-use sentinels used while body XML is rewritten.  They survive any
+# tag-stripping pass because they are plain characters, and they cannot occur
+# in source text.
+_IMG_SENTINEL_FMT = "\uE000IMG%d\uE001"
+_IMG_SENTINEL_RE = re.compile(r"\uE000IMG(\d+)\uE001")
+
+
+@dataclass
+class EmbeddedImage:
+    inner_path: str    # path inside the ODT/EPUB package, e.g. "Pictures/bx0_foo.png"
+    data: bytes
+    mime: str
+    width_cm: float
+    height_cm: float
+
+
+def _read_image_size(data: bytes, ext: str) -> Tuple[int, int]:
+    """Return ``(width_px, height_px)`` for a PNG or JPEG image; ``(0, 0)`` if unknown."""
+    import struct
+
+    if ext == ".png" and data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        w, h = struct.unpack(">II", data[16:24])
+        return int(w), int(h)
+    if ext in (".jpg", ".jpeg"):
+        i, n = 2, len(data)
+        while i < n:
+            while i < n and data[i] != 0xFF:
+                i += 1
+            while i < n and data[i] == 0xFF:
+                i += 1
+            if i >= n:
+                break
+            marker = data[i]
+            i += 1
+            # SOI/EOI/RSTn have no payload.
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                continue
+            if i + 2 > n:
+                break
+            seg_len = struct.unpack(">H", data[i:i + 2])[0]
+            # Any SOF marker (but not DHT=0xC4, JPG=0xC8, DAC=0xCC) holds the
+            # picture dimensions in its first 5 payload bytes.
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                if i + 7 <= n:
+                    h, w = struct.unpack(">HH", data[i + 3:i + 7])
+                    return int(w), int(h)
+                break
+            i += seg_len
+    return (0, 0)
+
+
+def _image_box(w_px: int, h_px: int, target_cm: float = IMAGE_TARGET_WIDTH_CM) -> Tuple[float, float]:
+    """Scale a pixel-sized image to the target width, keeping the aspect ratio."""
+    if w_px <= 0 or h_px <= 0:
+        return target_cm, target_cm * 0.75
+    return target_cm, target_cm * h_px / w_px
+
+
+def _find_image_file(images_dir: str, section_base: str, name: str) -> Optional[str]:
+    """Locate ``NAME.(png|jpg|jpeg)`` inside ``images_dir/section_base/``."""
+    folder = os.path.join(images_dir, section_base)
+    for ext in _IMG_EXTS:
+        p = os.path.join(folder, name + ext)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _image_paragraph(inner_path: str, w_cm: float, h_cm: float, name: str) -> str:
+    """ODF paragraph holding a centred, as-char image frame."""
+    return (
+        '<text:p text:style-name="BB_Image">'
+        '<draw:frame draw:name="%s" text:anchor-type="as-char"'
+        ' svg:width="%.3fcm" svg:height="%.3fcm">'
+        '<draw:image xlink:href="%s" xlink:type="simple"'
+        ' xlink:show="embed" xlink:actuate="onLoad"/>'
+        '</draw:frame></text:p>'
+    ) % (name, w_cm, h_cm, inner_path)
+
+
+def _has_visible_xml(s: str) -> bool:
+    """True if a paragraph-inner XML fragment carries any visible content."""
+    if re.sub(r"<[^>]+>", "", s).strip():
+        return True
+    return bool(re.search(r"<(text:span|text:tab|draw:|text:a)\b", s))
+
+
+def _extract_image_annotations(
+    body: str, section_index: int, section_base: str, images_dir: str,
+) -> Tuple[str, List[EmbeddedImage], List[str]]:
+    """Replace every ``[[image(NAME)]]`` annotation with a sentinel.
+
+    Returns the rewritten body, the list of images to embed and the list of
+    image-paragraph XMLs (indexed by sentinel number).
+    """
+    images: List[EmbeddedImage] = []
+    paragraphs: List[str] = []
+
+    def repl(m: "re.Match") -> str:
+        block = m.group(0)
+        imref = _IMG_REF_RE.search(block)
+        if not imref:
+            return block
+        name = imref.group(1).strip()
+        src = _find_image_file(images_dir, section_base, name)
+        if not src:
+            sys.stderr.write(
+                "warning: image %r not found in %s\n"
+                % (name, os.path.join(images_dir, section_base))
+            )
+            return block  # leave for the normal comment-stripping pass
+        ext = os.path.splitext(src)[1].lower()
+        mime = _IMG_MIME[ext]
+        with open(src, "rb") as fh:
+            data = fh.read()
+        w_px, h_px = _read_image_size(data, ext)
+        w_cm, h_cm = _image_box(w_px, h_px)
+        inner_path = "Pictures/bx%d_%s%s" % (section_index, name, ext)
+        frame_name = "img_bx%d_%s" % (section_index, name)
+        idx = len(paragraphs)
+        images.append(EmbeddedImage(inner_path, data, mime, w_cm, h_cm))
+        paragraphs.append(_image_paragraph(inner_path, w_cm, h_cm, frame_name))
+        return _IMG_SENTINEL_FMT % idx
+
+    new_body = _ANNOT_RE.sub(repl, body)
+    return new_body, images, paragraphs
+
+
+def _splice_image_paragraphs(body: str, image_paragraphs: List[str]) -> str:
+    """Replace image sentinels in ``body`` by splitting the surrounding paragraph.
+
+    A paragraph/heading that contains one or more sentinels is broken into
+    parts; the parts that carry visible content are re-emitted with the
+    original opening/closing tags, and the corresponding image paragraph is
+    inserted at each sentinel position.
+    """
+    if not image_paragraphs:
+        return body
+
+    def repl_para(m: "re.Match") -> str:
+        open_tag = m.group(1)
+        tag = m.group(2)
+        inner = m.group(3)
+        close_tag = "</text:%s>" % tag
+        if "\uE000IMG" not in inner:
+            return m.group(0)
+        out: List[str] = []
+        last = 0
+        for sm in _IMG_SENTINEL_RE.finditer(inner):
+            before = inner[last:sm.start()]
+            if _has_visible_xml(before):
+                out.append(open_tag + before + close_tag)
+            out.append(image_paragraphs[int(sm.group(1))])
+            last = sm.end()
+        rest = inner[last:]
+        if _has_visible_xml(rest):
+            out.append(open_tag + rest + close_tag)
+        return "".join(out)
+
+    return re.sub(
+        r"(<text:(p|h)\b[^>]*>)(.*?)</text:\2>",
+        repl_para, body, flags=re.S,
+    )
 
 
 def _namespace_auto_styles(auto_inner: str, body: str, prefix: str) -> Tuple[str, str]:
@@ -306,7 +487,9 @@ def _namespace_auto_styles(auto_inner: str, body: str, prefix: str) -> Tuple[str
     return attr_re.sub(repl, auto_inner), attr_re.sub(repl, body)
 
 
-def parse_section(path: str, index: int, keep_comments: bool) -> ParsedSection:
+def parse_section(path: str, index: int, keep_comments: bool,
+                  images_dir: Optional[str] = None,
+                  section_base: Optional[str] = None) -> ParsedSection:
     with zipfile.ZipFile(path) as z:
         content = z.read("content.xml").decode("utf-8")
         styles_xml = z.read("styles.xml").decode("utf-8")
@@ -325,6 +508,15 @@ def parse_section(path: str, index: int, keep_comments: bool) -> ParsedSection:
     body = re.sub(r"<office:forms\b.*?</office:forms>", "", body, count=1, flags=re.S)
     body = re.sub(r"<text:sequence-decls>.*?</text:sequence-decls>", "", body, count=1, flags=re.S)
 
+    # Extract [[image(NAME)]] annotations (replacing them with sentinels) before
+    # the generic comment-stripping pass below would discard them.
+    images: List[EmbeddedImage] = []
+    image_paragraphs: List[str] = []
+    if images_dir and section_base:
+        body, images, image_paragraphs = _extract_image_annotations(
+            body, index, section_base, images_dir,
+        )
+
     if not keep_comments:
         body = re.sub(r"<office:annotation\b.*?</office:annotation>", "", body, flags=re.S)
         body = re.sub(r"<office:annotation-end\b[^>]*?/>", "", body)
@@ -337,6 +529,11 @@ def parse_section(path: str, index: int, keep_comments: bool) -> ParsedSection:
     prefix = "bx%d_" % index
     auto_inner, body = _namespace_auto_styles(auto_inner, body, prefix)
 
+    # Now that paragraph boundaries are stable, split each paragraph that holds
+    # an image sentinel and insert the image paragraph in its place.
+    if image_paragraphs:
+        body = _splice_image_paragraphs(body, image_paragraphs)
+
     return ParsedSection(
         fonts=fonts,
         auto_styles=auto_inner,
@@ -347,6 +544,7 @@ def parse_section(path: str, index: int, keep_comments: bool) -> ParsedSection:
         master_styles=_inner("master-styles", styles_xml),
         content_ns=content_ns,
         styles_ns=styles_ns,
+        images=images,
     )
 
 
@@ -439,6 +637,11 @@ fo:font-size="40pt" style:font-size-asian="40pt" style:font-size-complex="40pt"/
 style:parent-style-name="Standard"><style:paragraph-properties \
 fo:text-align="center"/><style:text-properties fo:font-size="16pt" \
 fo:font-style="italic"/></style:style>\
+<style:style style:name="BB_Image" style:family="paragraph" \
+style:parent-style-name="Standard"><style:paragraph-properties \
+fo:text-align="center" style:justify-single-word="false" \
+fo:margin-top="0.5cm" fo:margin-bottom="0.5cm" \
+fo:keep-with-next="always" fo:keep-together="always"/></style:style>\
 """.replace("__SJ__", STYLE_STORY_JOURNAL)
 
 
@@ -602,8 +805,16 @@ def build_merged_odt(
     entry_titles: "Dict[int, Tuple[str, str]]",
     entry_level: int,
     cover: Optional[str] = None,
+    images_dir: Optional[str] = None,
 ) -> None:
-    parsed = [parse_section(s.path, i, keep_comments) for i, s in enumerate(sections)]
+    parsed = [
+        parse_section(
+            s.path, i, keep_comments,
+            images_dir=images_dir,
+            section_base=os.path.splitext(os.path.basename(s.path))[0],
+        )
+        for i, s in enumerate(sections)
+    ]
     index_of = {id(s): i for i, s in enumerate(sections)}
 
     content_ns = parsed[0].content_ns
@@ -713,7 +924,18 @@ def build_merged_odt(
         % (content_ns, content_fonts, all_auto, "".join(body_parts))
     )
 
-    _write_odt(out_path, content_xml, styles_xml, meta, cover_data)
+    # Collect every embedded image from every section (unique by inner_path;
+    # ``parse_section`` already prefixes them per section to avoid clashes).
+    embedded: List[EmbeddedImage] = []
+    seen_paths = set()
+    for p in parsed:
+        for img in p.images:
+            if img.inner_path in seen_paths:
+                continue
+            seen_paths.add(img.inner_path)
+            embedded.append(img)
+
+    _write_odt(out_path, content_xml, styles_xml, meta, cover_data, embedded)
 
 
 def _write_odt(
@@ -722,10 +944,12 @@ def _write_odt(
     styles_xml: str,
     meta: Meta,
     cover_data: Optional[Tuple[bytes, str, str]] = None,
+    embedded_images: Optional[List["EmbeddedImage"]] = None,
 ) -> None:
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     if os.path.exists(out_path):
         os.remove(out_path)
+    embedded_images = embedded_images or []
     # Build manifest dynamically so the cover image entry is included when needed.
     mf_entries = [
         ' <manifest:file-entry manifest:full-path="/" manifest:version="1.3" manifest:media-type="application/vnd.oasis.opendocument.text"/>',
@@ -737,6 +961,11 @@ def _write_odt(
         _, inner_path, mime = cover_data
         mf_entries.append(
             ' <manifest:file-entry manifest:full-path="%s" manifest:media-type="%s"/>' % (inner_path, mime)
+        )
+    for img in embedded_images:
+        mf_entries.append(
+            ' <manifest:file-entry manifest:full-path="%s" manifest:media-type="%s"/>'
+            % (img.inner_path, img.mime)
         )
     manifest = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -757,6 +986,8 @@ def _write_odt(
         if cover_data:
             img_bytes, inner_path, _ = cover_data
             z.writestr(inner_path, img_bytes)
+        for img in embedded_images:
+            z.writestr(img.inner_path, img.data)
 
 
 # --------------------------------------------------------------------------- #
@@ -792,23 +1023,79 @@ def _para_to_text(inner: str) -> str:
     return "\n".join(line.rstrip() for line in inner.split("\n")).strip()
 
 
-def _section_paragraphs(path: str, keep_comments: bool) -> List[str]:
-    """Return the non-empty paragraphs of a section as plain-text blocks."""
+def _section_blocks(
+    path: str,
+    keep_comments: bool,
+    images_dir: Optional[str] = None,
+    md_out_dir: Optional[str] = None,
+) -> List[Tuple[str, str]]:
+    """Yield typed paragraph blocks for a section.
+
+    Each entry is ``("text", text)`` or ``("image", path)`` (``path`` is
+    relative to ``md_out_dir`` when given, otherwise absolute).  When
+    ``images_dir`` is set, ``[[image(NAME)]]`` annotations are turned into
+    image blocks at their position in the document.
+    """
     with zipfile.ZipFile(path) as z:
         content = z.read("content.xml").decode("utf-8")
     m = re.search(r"<office:text\b[^>]*>(.*)</office:text>", content, re.S)
     body = m.group(1) if m else ""
+
+    section_base = os.path.splitext(os.path.basename(path))[0]
+    image_paths: List[str] = []
+
+    if images_dir:
+        def img_repl(am: "re.Match") -> str:
+            block = am.group(0)
+            imref = _IMG_REF_RE.search(block)
+            if not imref:
+                return block
+            name = imref.group(1).strip()
+            src = _find_image_file(images_dir, section_base, name)
+            if not src:
+                sys.stderr.write(
+                    "warning: image %r not found in %s\n"
+                    % (name, os.path.join(images_dir, section_base))
+                )
+                return block
+            if md_out_dir:
+                try:
+                    rel = os.path.relpath(src, md_out_dir)
+                except ValueError:
+                    rel = src
+            else:
+                rel = src
+            idx = len(image_paths)
+            image_paths.append(rel)
+            return _IMG_SENTINEL_FMT % idx
+
+        body = _ANNOT_RE.sub(img_repl, body)
+
     if not keep_comments:
         body = re.sub(r"<office:annotation\b.*?</office:annotation>", "", body, flags=re.S)
         body = re.sub(r"<office:annotation-end\b[^>]*?/>", "", body)
 
-    paras: List[str] = []
+    blocks: List[Tuple[str, str]] = []
     for m in re.finditer(r"<text:(p|h)\b[^>]*?(?:/>|>(.*?)</text:\1>)", body, re.S):
         inner = m.group(2) or ""
-        text = _para_to_text(inner)
-        if text:
-            paras.append(text)
-    return paras
+        if "\uE000IMG" in inner:
+            last = 0
+            for sm in _IMG_SENTINEL_RE.finditer(inner):
+                pre = inner[last:sm.start()]
+                t = _para_to_text(pre)
+                if t:
+                    blocks.append(("text", t))
+                blocks.append(("image", image_paths[int(sm.group(1))]))
+                last = sm.end()
+            rest = inner[last:]
+            t = _para_to_text(rest)
+            if t:
+                blocks.append(("text", t))
+        else:
+            t = _para_to_text(inner)
+            if t:
+                blocks.append(("text", t))
+    return blocks
 
 
 def _md_block(text: str) -> str:
@@ -831,6 +1118,8 @@ def build_markdown(
     chapter_titles: "Dict[int, str]",
     entry_titles: "Dict[int, Tuple[str, str]]",
     entry_level: int = 2,
+    images_dir: Optional[str] = None,
+    md_out_dir: Optional[str] = None,
 ) -> str:
     out: List[str] = []
     top_title = complete and with_title_page
@@ -860,8 +1149,14 @@ def build_markdown(
             if ewhen:
                 out.append("*" + ewhen + "*")
             out.append("")
-        for para in _section_paragraphs(sec.path, keep_comments):
-            out.append(_md_block(para))
+        for kind, payload in _section_blocks(
+            sec.path, keep_comments,
+            images_dir=images_dir, md_out_dir=md_out_dir,
+        ):
+            if kind == "image":
+                out.append("![](%s)" % payload)
+            else:
+                out.append(_md_block(payload))
             out.append("")
 
     if chapter_headings:
@@ -925,12 +1220,18 @@ def convert(soffice: str, odt_path: str, fmt: str, out_dir: str, profile: str) -
     return produced
 
 
-def _fix_epub_cover(epub_path: str) -> None:
-    """Patch the EPUB OPF so the first image is declared as the cover image.
+def _fix_epub_cover(epub_path: str, cover_src: Optional[str] = None) -> None:
+    """Patch the EPUB OPF so the correct image is declared as the cover image.
 
-    LibreOffice exports the image but does not set ``properties="cover-image"``
-    or the EPUB 2 ``<meta name="cover">`` entry.  This post-process step adds
-    both so that every EPUB reader recognises the cover correctly.
+    LibreOffice exports the cover image but does not set
+    ``properties="cover-image"`` or the EPUB 2 ``<meta name="cover">`` entry.
+    Furthermore the order of ``<item>`` entries in the OPF manifest is not
+    stable, so we cannot just tag the first image — when other pictures are
+    embedded too LibreOffice may list one of them first.
+
+    When ``cover_src`` is given we read the source image and find the manifest
+    item whose stored bytes match it; otherwise we fall back to the first
+    image item in the manifest (single-image case).
     """
     import io as _io
 
@@ -943,34 +1244,71 @@ def _fix_epub_cover(epub_path: str) -> None:
 
     opf = files[opf_name].decode("utf-8")
 
-    # Find the first image item in the manifest.
-    m = re.search(
-        r'(<item\b([^>]*)\bmedia-type="image/[^"]*"([^>]*)/>)',
-        opf,
+    # All image items in the manifest, in document order.
+    item_re = re.compile(
+        r'<item\b[^>]*\bmedia-type="image/[^"]*"[^>]*/>'
     )
-    if m is None:
-        return   # no image at all – nothing to do
+    image_items = [m.group(0) for m in item_re.finditer(opf)]
+    if not image_items:
+        return
 
-    full_tag = m.group(1)
-    attrs = m.group(2) + m.group(3)
-    id_m = re.search(r'\bid="([^"]+)"', attrs)
+    # OPF hrefs are relative to the OPF file's folder; compute the EPUB-local
+    # zip path for each <item>.
+    opf_dir = os.path.dirname(opf_name)
+
+    def item_href(tag: str) -> Optional[str]:
+        hm = re.search(r'\bhref="([^"]+)"', tag)
+        if not hm:
+            return None
+        href = hm.group(1)
+        return (opf_dir + "/" + href) if opf_dir else href
+
+    # Pick the manifest item that actually carries the cover image.
+    target_tag: Optional[str] = None
+    if cover_src and os.path.exists(cover_src):
+        try:
+            with open(cover_src, "rb") as fh:
+                cover_bytes = fh.read()
+            for tag in image_items:
+                href = item_href(tag)
+                if href and files.get(href) == cover_bytes:
+                    target_tag = tag
+                    break
+        except OSError:
+            target_tag = None
+    if target_tag is None:
+        target_tag = image_items[0]
+
+    id_m = re.search(r'\bid="([^"]+)"', target_tag)
     item_id = id_m.group(1) if id_m else "cover-image"
 
     # Add properties="cover-image" if not already present.
-    if "cover-image" not in full_tag:
-        new_tag = full_tag.replace("/>", ' properties="cover-image"/>', 1)
+    final_tag = target_tag
+    if 'properties="cover-image"' not in target_tag:
+        new_tag = target_tag.replace("/>", ' properties="cover-image"/>', 1)
         # Rename id to "cover-image" for maximum compatibility.
         new_tag = re.sub(r'\bid="[^"]+"', 'id="cover-image"', new_tag, count=1)
-        opf = opf.replace(full_tag, new_tag, 1)
+        opf = opf.replace(target_tag, new_tag, 1)
         # Update any spine/guide reference to the old id.
         if item_id != "cover-image":
             opf = opf.replace('idref="%s"' % item_id, 'idref="cover-image"')
         item_id = "cover-image"
+        final_tag = new_tag
 
-    # Add EPUB 2 <meta name="cover"> inside <metadata> if missing.
+    # Make sure no *other* image item still carries properties="cover-image"
+    # (a previous patch run may have tagged the wrong one).
+    def _strip_other_cover(m: "re.Match") -> str:
+        tag = m.group(0)
+        if tag == final_tag or 'properties="cover-image"' not in tag:
+            return tag
+        return re.sub(r'\s*properties="cover-image"', "", tag, count=1)
+
+    opf = item_re.sub(_strip_other_cover, opf)
+
+    # Add EPUB 2 <meta name="cover"> inside <metadata> if missing/outdated.
+    opf = re.sub(r'\s*<meta[^>]*\bname="cover"[^/]*/>', "", opf)
     cover_meta = '<meta name="cover" content="%s"/>' % item_id
-    if cover_meta not in opf and 'name="cover"' not in opf:
-        opf = opf.replace("</metadata>", "  %s\n  </metadata>" % cover_meta, 1)
+    opf = opf.replace("</metadata>", "  %s\n  </metadata>" % cover_meta, 1)
 
     files[opf_name] = opf.encode("utf-8")
 
@@ -1019,6 +1357,24 @@ class Edition:
     entry_titles: "Dict[int, Tuple[str, str]]"
     entry_level: int
     cover: Optional[str] = None
+    images_dir: Optional[str] = None
+
+
+def _tagebuch_cover(cover_path: Optional[str]) -> Optional[str]:
+    """Pick the *Tagebuch*-specific cover when one sits next to ``cover_path``.
+
+    If the user passes ``--cover data/images/Cover.png`` the journal-only
+    edition automatically uses ``data/images/Cover_Tagebuch.<ext>`` when such a
+    file exists; otherwise the standard cover is kept.
+    """
+    if not cover_path:
+        return None
+    folder = os.path.dirname(cover_path) or "."
+    for ext in _IMG_EXTS:
+        cand = os.path.join(folder, "Cover_Tagebuch" + ext)
+        if os.path.exists(cand):
+            return cand
+    return cover_path
 
 
 def build_editions(
@@ -1053,7 +1409,8 @@ def build_editions(
                     chapter_titles={},
                     entry_titles=config.entry_titles,
                     entry_level=1,
-                    cover=getattr(args, "cover", None),
+                    cover=_tagebuch_cover(getattr(args, "cover", None)),
+                    images_dir=getattr(args, "_images_dir", None),
                 )
             )
         else:
@@ -1073,6 +1430,7 @@ def build_editions(
                         chapter_titles={},
                         entry_titles=config.entry_titles,
                         entry_level=1,
+                        images_dir=getattr(args, "_images_dir", None),
                     )
                 )
         return editions
@@ -1097,6 +1455,7 @@ def build_editions(
                 entry_titles=config.entry_titles,
                 entry_level=2,
                 cover=getattr(args, "cover", None),
+                images_dir=getattr(args, "_images_dir", None),
             )
         )
     else:
@@ -1116,6 +1475,7 @@ def build_editions(
                     chapter_titles=config.chapter_titles,
                     entry_titles=config.entry_titles,
                     entry_level=2,
+                    images_dir=getattr(args, "_images_dir", None),
                 )
             )
     return editions
@@ -1164,12 +1524,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--source", default=DEFAULT_SOURCE, help="Folder with the section .odt files.")
     p.add_argument("--config", default=DEFAULT_CONFIG, help="Path to buchbinder.ini (titles/metadata).")
     p.add_argument("--cover", default=None, help="Path to a JPG or PNG cover image (embedded as the first page).")
+    p.add_argument(
+        "--embed-images", action="store_true",
+        help="Embed pictures referenced by [[image(NAME)]] ODT annotations. "
+             "Pictures are looked up in <images-dir>/<section-base>/<NAME>.(png|jpg|jpeg).",
+    )
+    p.add_argument(
+        "--images-dir", default=DEFAULT_IMAGES,
+        help="Root folder containing per-section image subfolders (default: data/images).",
+    )
     p.add_argument("--publish", default=DEFAULT_PUBLISH, help="Output root (data/publish).")
     p.add_argument("--soffice", default=None, help="Path to the LibreOffice 'soffice' binary.")
     p.add_argument("--keep-build", action="store_true", help="Keep the intermediate merged ODT build folder.")
     args = p.parse_args(argv)
 
     formats = args.formats or ["pdf"]
+
+    # Resolve image-embedding intent into a single value the editions inspect.
+    args._images_dir = (
+        os.path.abspath(args.images_dir) if args.embed_images and args.images_dir else None
+    )
+    if args.embed_images and not os.path.isdir(args._images_dir or ""):
+        sys.stderr.write(
+            "warning: --embed-images set but images directory %r does not exist\n"
+            % args._images_dir
+        )
 
     config = load_config(args.config)
 
@@ -1219,6 +1598,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     entry_titles=ed.entry_titles,
                     entry_level=ed.entry_level,
                     cover=ed.cover,
+                    images_dir=ed.images_dir,
                 )
 
             for fmt in formats:
@@ -1237,6 +1617,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         chapter_titles=ed.chapter_titles,
                         entry_titles=ed.entry_titles,
                         entry_level=ed.entry_level,
+                        images_dir=ed.images_dir,
+                        md_out_dir=out_dir,
                     )
                     dest = os.path.join(out_dir, ed.base + ".md")
                     with open(dest, "w", encoding="utf-8") as fh:
@@ -1249,7 +1631,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 else:
                     produced = convert(soffice, odt_path, fmt, out_dir, profile)
                     if fmt == "epub" and ed.cover:
-                        _fix_epub_cover(produced)
+                        _fix_epub_cover(produced, ed.cover)
                     print("wrote", os.path.relpath(produced, PROJECT_ROOT))
     finally:
         shutil.rmtree(profile, ignore_errors=True)

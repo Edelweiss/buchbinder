@@ -32,6 +32,9 @@ python3 tools/buchbinder.py --tagebuch -f pdf -f epub -f html -f odt -f md
 
 # book with table of contents in all formats
 python3 tools/buchbinder.py --index --cover data/images/Cover.png -f pdf -f epub -f html -f odt -f md
+
+# journal with embedded pictures (PDF + EPUB + Markdown)
+python3 tools/buchbinder.py --tagebuch --embed-images -f pdf -f epub -f md
 ```
 
 No installation step is required — it is a single Python file using only the
@@ -55,6 +58,8 @@ standard library. LibreOffice must be installed for every format except `odt`.
 | `--source`          | `data/edelweiss`                | Folder containing the `NNNN_Type_Title.odt` section files.              |
 | `--config`          | `…/Buchbinder/buchbinder.ini`   | INI file with titles, chapter/entry names and document metadata.        |
 | `--cover`           | none                            | Path to a JPG or PNG cover image (embedded as the first page; used as the EPUB cover). Only applied in `complete` mode. |
+| `--embed-images`    | off                             | Embed pictures referenced by `[[image(NAME)]]` ODT annotations at their position in the text. |
+| `--images-dir`      | `data/images`                   | Root folder; each section looks up its pictures in `<images-dir>/<section-base>/<NAME>.(png\|jpg\|jpeg)`. |
 | `--publish`         | `data/publish`                  | Output root folder.                                                     |
 | `--soffice`         | auto-detected                   | Path to the LibreOffice `soffice` binary.                               |
 | `--keep-build`      | off                             | Keep the intermediate merged ODT in `data/publish/.build`.              |
@@ -129,6 +134,37 @@ standard library. LibreOffice must be installed for every format except `odt`.
   the content area, so prefer 1 : 1.51.
 - The cover is only applied to `complete`-mode editions (the full book and the
   full *Wilhelms Tagebuch*); per-chapter exports ignore `--cover`.
+- When building the *Tagebuch* edition (`--tagebuch`), Buchbinder automatically
+  prefers a sibling file called `Cover_Tagebuch.<ext>` next to the path passed
+  to `--cover`. So `--cover data/images/Cover.png --tagebuch` picks up
+  `data/images/Cover_Tagebuch.png` for the journal-only release while the full
+  book keeps using `Cover.png`. If no such sibling exists, the standard cover
+  is used as-is.
+
+### Embedded pictures (`--embed-images`)
+
+- The manuscript can mark picture insertion points with an ODT comment of the
+  form `[[image(NAME)]]`, e.g. `[[image(045_Abfahrt_Wald)]]`. With
+  `--embed-images` Buchbinder turns each such comment into an embedded picture
+  at exactly that point in the text.
+- Pictures are looked up under `<images-dir>/<section-base>/<NAME>.<ext>`,
+  where `<section-base>` is the section file name without its `.odt`
+  extension. For `0102_Journal_ListeDerWinter.odt` the comment
+  `[[image(045_Abfahrt_Wald)]]` resolves to
+  `data/images/0102_Journal_ListeDerWinter/045_Abfahrt_Wald.png` (PNG, JPG and
+  JPEG are accepted).
+- Override the root with `--images-dir path/to/images`. A missing picture
+  prints a warning and the comment is left/dropped just like any other
+  annotation.
+- Pictures are scaled to a uniform display width of **12 cm**, keeping the
+  source aspect ratio, and placed in a centred paragraph with a small top/bottom
+  margin (style `BB_Image`). The enclosing source paragraph is split at the
+  comment, so any text before/after the marker stays in its own paragraph.
+- The pictures are embedded into the ODT, PDF and EPUB outputs and exported
+  alongside the HTML. In Markdown they become `![](relative/path/to/file)`
+  references with a path relative to `data/publish/md/`.
+- Other annotations are still removed unless `--keep-comments` is given;
+  `--embed-images` only handles the `[[image(...)]]` form.
 
 ### Table of contents (`--index`)
 
